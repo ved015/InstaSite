@@ -1,32 +1,37 @@
-import React, { useEffect, useState } from 'react';
-import { WebContainer } from '@webcontainer/api';
-import { FileAction } from '../types'; // Adjust import path as needed
-
-// If you want to log process output, you can import a polyfill for WritableStream in older browsers:
-// import { WritableStream } from 'web-streams-polyfill/ponyfill';
+import React, { useEffect, useState } from "react";
+import { WebContainer } from "@webcontainer/api";
+import { FileAction } from "../types";
+import { Loader2, CheckCircle2, Terminal } from "lucide-react";
 
 interface PreviewFrameProps {
-  files: FileAction[];              // The list of files from your artifact
-  webContainer: WebContainer | null; 
+  files: FileAction[];
+  webContainer: WebContainer | null;
 }
 
-/**
- * A separate component that:
- * 1) Mounts your files into the WebContainer
- * 2) Installs dependencies
- * 3) Runs `npm run dev`
- * 4) Renders the dev server in an iframe on success
- */
 export function PreviewFrame({ files, webContainer }: PreviewFrameProps) {
-  const [url, setUrl] = useState<string>('');
+  const [url, setUrl] = useState<string>("");
+  const [status, setStatus] = useState<
+    "initializing" | "installing" | "starting" | "ready" | "error"
+  >("initializing");
+  const [logs, setLogs] = useState<string[]>([]);
 
-  // Convert flat paths ("src/pages/home.tsx") into the nested structure
-  // WebContainer expects: { "src": { directory: { "pages": { directory: { "home.tsx": { file: { contents } }}}}}}
+  function addLog(msg: string) {
+    // Strip ALL ANSI escape sequences (colors, cursor movements, etc.)
+    // eslint-disable-next-line no-control-regex
+    const cleanMsg = msg
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "") // All ANSI sequences
+      .replace(/[\x00-\x1f\x7f]/g, "") // Remove other control characters
+      .trim();
+    if (cleanMsg) {
+      setLogs((prev) => [...prev.slice(-49), cleanMsg]); // Keep last 50 logs
+    }
+  }
+
   function createMountStructure(actions: FileAction[]): Record<string, any> {
     const root: Record<string, any> = {};
 
     for (const action of actions) {
-      const parts = action.filePath.split('/');
+      const parts = action.filePath.split("/");
       let curr = root;
 
       for (let i = 0; i < parts.length; i++) {
@@ -34,9 +39,8 @@ export function PreviewFrame({ files, webContainer }: PreviewFrameProps) {
         const isLastPart = i === parts.length - 1;
 
         if (isLastPart) {
-          // It's a file
-          let content = action.content ?? '';
-          if (typeof content !== 'string') {
+          let content = action.content ?? "";
+          if (typeof content !== "string") {
             try {
               content = JSON.stringify(content, null, 2);
             } catch {
@@ -45,7 +49,6 @@ export function PreviewFrame({ files, webContainer }: PreviewFrameProps) {
           }
           curr[part] = { file: { contents: content } };
         } else {
-          // It's a folder
           if (!curr[part]) {
             curr[part] = { directory: {} };
           }
@@ -57,60 +60,148 @@ export function PreviewFrame({ files, webContainer }: PreviewFrameProps) {
   }
 
   useEffect(() => {
-    if (!webContainer || files.length === 0) return;
+    if (!webContainer) return;
+
+    // Handle empty actions gracefully
+    if (files.length === 0) {
+      setStatus("error");
+      addLog("No files to mount.");
+      return;
+    }
 
     async function mountAndRun() {
       try {
-        // 1) Build the nested structure
+        setStatus("initializing");
         const structure = createMountStructure(files);
-        console.log('Mounting structure into WebContainer:', structure);
 
-        // 2) Mount the files
         await webContainer.mount(structure);
 
-        // 3) Listen for server-ready event
-        webContainer.on('server-ready', (port: number, url: string) => {
-          console.log('[server-ready]', port, url);
-          setUrl(url);
-        });
+        // Check for package.json
+        const hasPackageJson = files.some(
+          (f) =>
+            f.filePath === "package.json" ||
+            f.filePath.endsWith("/package.json"),
+        );
 
-        // 4) Spawn npm install + npm run dev
-        const installProcess = await webContainer.spawn('npm', ['install']);
-        const installExitCode = await installProcess.exit;
-        if (installExitCode !== 0) {
-          throw new Error('npm install failed');
-        }
+        if (hasPackageJson) {
+          setStatus("installing");
+          addLog("Installing dependencies...");
 
-        const devProcess = await webContainer.spawn('npm', ['run', 'dev']);
-        // If you want to log the dev server output to console, you can do:
-        /*
-        devProcess.output.pipeTo(new WritableStream({
-          write(data) {
-            console.log('[dev server]', data);
+          const installProcess = await webContainer.spawn("npm", ["install"]);
+
+          installProcess.output.pipeTo(
+            new WritableStream({
+              write(data) {
+                addLog(data);
+              },
+            }),
+          );
+
+          const installExitCode = await installProcess.exit;
+
+          if (installExitCode !== 0) {
+            throw new Error("npm install failed");
           }
-        }));
-        */
-      } catch (err) {
-        console.error('PreviewFrame error:', err);
+
+          setStatus("starting");
+          addLog("Starting dev server...");
+
+          webContainer.on("server-ready", (port: number, url: string) => {
+            setUrl(url);
+            setStatus("ready");
+            addLog(`Server ready at ${url}`);
+          });
+
+          const devProcess = await webContainer.spawn("npm", ["run", "dev"]);
+
+          devProcess.output.pipeTo(
+            new WritableStream({
+              write(data) {
+                addLog(data);
+              },
+            }),
+          );
+        } else {
+          addLog("No package.json found. Skipping install.");
+          // We can't run dev server without package.json usually
+        }
+      } catch (err: any) {
+        console.error("PreviewFrame error:", err);
+        setStatus("error");
+        addLog(`Error: ${err.message}`);
       }
     }
 
     mountAndRun();
   }, [webContainer, files]);
 
-  // Show a loading message until we have a URL
   return (
-    <div className="h-full w-full flex items-center justify-center bg-gray-800">
+    <div className="h-full w-full bg-gray-900 border border-gray-800 rounded-lg overflow-hidden flex flex-col relative">
       {!url && (
-        <div className="text-gray-300">
-          <p>Starting dev server...</p>
+        <div className="flex-1 flex flex-col items-center justify-center p-8 space-y-6">
+          <div className="flex flex-col space-y-4 w-full max-w-md">
+            <div className="flex items-center space-x-3 text-gray-400">
+              {status === "initializing" || status === "installing" ? (
+                <Loader2 className="w-5 h-5 animate-spin text-blue-400" />
+              ) : (
+                <CheckCircle2 className="w-5 h-5 text-green-500" />
+              )}
+              <span>Initializing environment...</span>
+            </div>
+
+            <div className="flex items-center space-x-3 text-gray-400">
+              {status === "installing" ? (
+                <Loader2 className="w-5 h-5 animate-spin text-blue-400" />
+              ) : status === "starting" || status === "ready" ? (
+                <CheckCircle2 className="w-5 h-5 text-green-500" />
+              ) : (
+                <div className="w-5 h-5" />
+              )}
+              <span
+                className={status === "initializing" ? "text-gray-600" : ""}
+              >
+                Installing dependencies...
+              </span>
+            </div>
+
+            <div className="flex items-center space-x-3 text-gray-400">
+              {status === "starting" ? (
+                <Loader2 className="w-5 h-5 animate-spin text-blue-400" />
+              ) : status === "ready" ? (
+                <CheckCircle2 className="w-5 h-5 text-green-500" />
+              ) : (
+                <div className="w-5 h-5" />
+              )}
+              <span
+                className={
+                  status === "initializing" || status === "installing"
+                    ? "text-gray-600"
+                    : ""
+                }
+              >
+                Starting development server...
+              </span>
+            </div>
+          </div>
+
+          <div className="w-full max-w-md bg-black/50 rounded-lg p-4 font-mono text-xs text-gray-500 h-32 overflow-hidden relative">
+            <div className="absolute top-2 right-2">
+              <Terminal className="w-4 h-4 opacity-50" />
+            </div>
+            {logs.map((log, i) => (
+              <div key={i} className="whitespace-pre-wrap">
+                {log}
+              </div>
+            ))}
+          </div>
         </div>
       )}
+
       {url && (
         <iframe
           src={url}
           title="Preview"
-          className="w-full h-full border-0"
+          className="w-full h-full border-0 bg-white"
         />
       )}
     </div>
